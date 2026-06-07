@@ -1,341 +1,260 @@
-/**
- * Koishi 小说下载插件
- * 支持番茄小说等平台的TXT格式电子书下载
- * 
- * @author Qingyan Agent
- * @version 1.0.0
- */
+import { Context, Schema, h } from 'koishi'
+import { setTimeout } from 'timers/promises'
 
-import { Context, Schema, h, Logger, Session } from 'koishi'
-import { NovelDownloadService } from './services/downloader'
-import { Config, NovelDownloaderConfig, defaultConfig, NovelPlatform, NovelInfo } from './api/types'
+export const name = 'tomato-downloader'
+export const inject = ['puppeteer']
 
-const logger = new Logger('novel-downloader')
+export interface Config {
+  apiBase: string
+  apiPassword: string
+  enableImage?: boolean
+  imageWidth?: number
+  debug?: boolean
+}
 
-// 导出配置Schema
-export { Config }
+export const Config: Schema<Config> = Schema.object({
+  apiBase: Schema.string().required().description('TND 服务地址，如 http://tnd.th-dd.top'),
+  apiPassword: Schema.string().required().description('TND 服务的密码锁密码'),
+  enableImage: Schema.boolean().default(true).description('将搜索结果渲染为图片（需要 koishi-plugin-puppeteer）'),
+  imageWidth: Schema.number().default(800).description('图片宽度'),
+  debug: Schema.boolean().default(false).description('开启调试日志')
+})
 
-// 声明插件名称
-export const name = 'novel-downloader'
+const searchCache = new Map<string, { items: any[], timestamp: number }>()
+const CACHE_TTL = 5 * 60 * 1000 // 5分钟
 
-// 声明插件可注入的服务
-export const inject = ['http']
+export function apply(ctx: Context, config: Config) {
+  const base = config.apiBase.replace(/\/$/, '')
+  let cookieString: string | null = null
 
-// 插件主函数
-export function apply(ctx: Context, config: NovelDownloaderConfig) {
-  // 合并默认配置
-  const finalConfig = { ...defaultConfig, ...config }
-  
-  // 初始化下载服务
-  const downloadService = new NovelDownloadService(ctx, finalConfig)
-  
-  // 注册服务到上下文
-  ctx.novelDownloader = downloadService as any
+  function logDebug(...args: any[]) {
+    if (config.debug) ctx.logger.debug('[DEBUG]', ...args)
+  }
 
-  logger.info('小说下载插件已启动')
-
-  // ==================== 命令注册 ====================
-
-  /**
-   * 小说搜索命令
-   * 用法: novel.search <关键词>
-   */
-  ctx.command('novel.search <keyword:text>', '搜索小说')
-    .alias('小说搜索')
-    .alias('n搜索')
-    .option('page', '-p <page:number> 页码', { fallback: 1 })
-    .option('platform', '-t <platform> 平台(fanqie)', { fallback: 'fanqie' })
-    .action(async ({ session, options }, keyword) => {
-      if (!keyword) {
-        return '请输入搜索关键词，例如: novel.search 斗破苍穹'
-      }
-
-      await session.send(`正在搜索 "${keyword}"，请稍候...`)
-
-      try {
-        const result = await downloadService.search(
-          keyword,
-          options.platform as NovelPlatform,
-          options.page
-        )
-
-        if (result.novels.length === 0) {
-          return '未找到相关小说，请尝试其他关键词。'
-        }
-
-        const lines: string[] = []
-        lines.push(`📚 搜索结果 (第${options.page}页，共${result.total}部)`)
-        lines.push('─'.repeat(30))
-
-        result.novels.slice(0, 10).forEach((novel, index) => {
-          const status = novel.status === '已完结' ? '✅' : '📖'
-          const words = novel.wordCount ? `${(novel.wordCount / 10000).toFixed(1)}万字` : ''
-          lines.push(`${index + 1}. ${status}《${novel.title}》`)
-          lines.push(`   作者: ${novel.author} ${words ? `| ${words}` : ''}`)
-          lines.push(`   ID: ${novel.id}`)
-        })
-
-        lines.push('─'.repeat(30))
-        lines.push('💡 使用 novel.info <ID> 查看详情')
-        lines.push('💡 使用 novel.download <ID> 下载小说')
-
-        return lines.join('\n')
-      } catch (error) {
-        logger.error('搜索失败:', error)
-        return `搜索失败: ${error.message}`
-      }
-    })
-
-  /**
-   * 小说详情命令
-   * 用法: novel.info <小说ID>
-   */
-  ctx.command('novel.info <id:string>', '查看小说详情')
-    .alias('小说详情')
-    .alias('n详情')
-    .option('platform', '-t <platform> 平台', { fallback: 'fanqie' })
-    .action(async ({ session, options }, id) => {
-      if (!id) {
-        return '请输入小说ID，例如: novel.info 7143038691944959011'
-      }
-
-      // 尝试解析URL
-      const novelId = downloadService.parseNovelId(id) || id
-
-      await session.send('正在获取小说信息...')
-
-      try {
-        const novel = await downloadService.getNovelInfo(novelId)
-
-        const lines: string[] = []
-        lines.push('📖 小说详情')
-        lines.push('═'.repeat(30))
-        lines.push(`书名: 《${novel.title}》`)
-        lines.push(`作者: ${novel.author}`)
-        lines.push(`状态: ${novel.status || '未知'}`)
-        
-        if (novel.wordCount) {
-          lines.push(`字数: ${(novel.wordCount / 10000).toFixed(1)}万字`)
-        }
-        
-        if (novel.chapterCount) {
-          lines.push(`章节: ${novel.chapterCount}章`)
-        }
-
-        if (novel.description) {
-          lines.push('─'.repeat(30))
-          lines.push('简介:')
-          // 截断过长的简介
-          const desc = novel.description.length > 200 
-            ? novel.description.substring(0, 200) + '...' 
-            : novel.description
-          lines.push(desc)
-        }
-
-        lines.push('─'.repeat(30))
-        lines.push(`ID: ${novel.id}`)
-        lines.push('💡 使用 novel.download ' + novel.id + ' 下载')
-
-        return lines.join('\n')
-      } catch (error) {
-        logger.error('获取详情失败:', error)
-        return `获取详情失败: ${error.message}`
-      }
-    })
-
-  /**
-   * 小说下载命令
-   * 用法: novel.download <小说ID>
-   */
-  ctx.command('novel.download <id:string>', '下载小说')
-    .alias('小说下载')
-    .alias('n下载')
-    .option('platform', '-t <platform> 平台', { fallback: 'fanqie' })
-    .option('format', '-f <format> 格式(txt/epub)', { fallback: finalConfig.defaultFormat })
-    .option('encoding', '-e <encoding> 编码(utf-8/gbk)', { fallback: finalConfig.defaultEncoding })
-    .option('start', '-s <start:number> 起始章节', { fallback: 1 })
-    .option('end', '-d <end:number> 结束章节', { fallback: 0 })
-    .action(async ({ session, options }, id) => {
-      if (!id) {
-        return '请输入小说ID，例如: novel.download 7143038691944949011'
-      }
-
-      // 尝试解析URL
-      const novelId = downloadService.parseNovelId(id) || id
-
-      try {
-        // 先获取小说信息
-        const novel = await downloadService.getNovelInfo(novelId)
-        
-        // 确认下载
-        const chapterInfo = options.end > 0 
-          ? `第${options.start}-${options.end}章`
-          : '全部章节'
-        
-        await session.send(
-          `即将下载《${novel.title}》(${chapterInfo})\n` +
-          `格式: ${options.format} | 编码: ${options.encoding}\n` +
-          `正在开始下载...`
-        )
-
-        // 创建下载任务
-        const downloadOptions: any = {
-          format: options.format,
-          encoding: options.encoding
-        }
-
-        if (options.end > 0) {
-          downloadOptions.chapterRange = {
-            start: options.start,
-            end: options.end
-          }
-        }
-
-        const task = await downloadService.createTask(
-          novelId,
-          options.platform as NovelPlatform,
-          downloadOptions
-        )
-
-        // 等待下载完成或定期更新进度
-        let lastProgress = 0
-        const maxWaitTime = 10 * 60 * 1000 // 最多等待10分钟
-        const startTime = Date.now()
-
-        while (true) {
-          const currentTask = await downloadService.getTaskStatus(task.id)
-          
-          if (!currentTask) {
-            return '下载任务丢失，请重试。'
-          }
-
-          if (currentTask.status === 'completed') {
-            return (
-              `✅ 下载完成！\n` +
-              `书名: 《${novel.title}》\n` +
-              `章节: ${currentTask.downloadedChapters}/${currentTask.totalChapters}\n` +
-              `文件: ${currentTask.filePath}\n` +
-              `💡 文件已保存到服务器，请联系管理员获取。`
-            )
-          }
-
-          if (currentTask.status === 'failed') {
-            return `❌ 下载失败: ${currentTask.error}`
-          }
-
-          // 更新进度
-          if (currentTask.progress > lastProgress + 10) {
-            await session.send(
-              `📥 下载中... ${currentTask.progress}%\n` +
-              `已下载: ${currentTask.downloadedChapters}/${currentTask.totalChapters}章`
-            )
-            lastProgress = currentTask.progress
-          }
-
-          // 检查超时
-          if (Date.now() - startTime > maxWaitTime) {
-            return '下载超时，任务仍在后台进行。请稍后使用 novel.tasks 查看状态。'
-          }
-
-          // 等待一段时间再检查
-          await new Promise(resolve => setTimeout(resolve, 2000))
-        }
-      } catch (error) {
-        logger.error('下载失败:', error)
-        return `下载失败: ${error.message}`
-      }
-    })
-
-  /**
-   * 查看下载任务命令
-   */
-  ctx.command('novel.tasks', '查看下载任务')
-    .alias('小说任务')
-    .alias('n任务')
-    .action(async ({ session }) => {
-      const tasks = await downloadService.getAllTasks()
-
-      if (tasks.length === 0) {
-        return '暂无下载任务。'
-      }
-
-      const lines: string[] = []
-      lines.push('📋 下载任务列表')
-      lines.push('─'.repeat(30))
-
-      tasks.slice(-10).reverse().forEach((task, index) => {
-        const statusMap: Record<string, string> = {
-          pending: '⏳ 等待中',
-          downloading: `📥 下载中 ${task.progress}%`,
-          completed: '✅ 已完成',
-          failed: '❌ 失败'
-        }
-        
-        lines.push(`${index + 1}. 《${task.title}》`)
-        lines.push(`   状态: ${statusMap[task.status] || task.status}`)
-        
-        if (task.status === 'downloading') {
-          lines.push(`   进度: ${task.downloadedChapters}/${task.totalChapters}章`)
-        }
-        
-        if (task.error) {
-          lines.push(`   错误: ${task.error}`)
-        }
-        
-        lines.push(`   ID: ${task.id}`)
+  // 登录获取 Cookie
+  async function login(): Promise<boolean> {
+    if (cookieString) return true
+    logDebug('登录 TND:', `${base}/api/login`)
+    try {
+      const res = await fetch(`${base}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: config.apiPassword })
       })
+      if (res.status === 200) {
+        const setCookies = res.headers.getSetCookie?.() || []
+        if (setCookies.length) {
+          cookieString = setCookies.map(c => c.split(';')[0]).join('; ')
+        } else {
+          const single = res.headers.get('set-cookie')
+          if (single) cookieString = single
+        }
+        ctx.logger.info('TND 登录成功')
+        return true
+      }
+      ctx.logger.error(`登录失败: ${res.status}`)
+      return false
+    } catch (e: any) {
+      ctx.logger.error(`登录异常: ${e.message}`)
+      return false
+    }
+  }
 
-      return lines.join('\n')
-    })
+  function getHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (cookieString) headers['Cookie'] = cookieString
+    return headers
+  }
 
-  /**
-   * 清理任务命令
-   */
-  ctx.command('novel.clear', '清理已完成任务')
-    .alias('小说清理')
-    .action(async ({ session }) => {
-      const count = await downloadService.clearCompletedTasks()
-      return `已清理 ${count} 个已完成任务。`
+  async function authedFetch(path: string, options?: RequestInit, retry = 3): Promise<Response> {
+    if (!cookieString) await login()
+    let res = await fetch(`${base}${path}`, {
+      ...options,
+      headers: { ...getHeaders(), ...(options?.headers || {}) }
     })
+    if (res.status === 429 && retry > 0) {
+      const wait = parseInt(res.headers.get('Retry-After') || '15') * 1000
+      ctx.logger.warn(`限流，等待 ${wait/1000}s`)
+      await setTimeout(wait)
+      return authedFetch(path, options, retry - 1)
+    }
+    if (res.status === 401 && cookieString) {
+      ctx.logger.warn('Cookie 失效，重新登录')
+      cookieString = null
+      await login()
+      return fetch(`${base}${path}`, {
+        ...options,
+        headers: { ...getHeaders(), ...(options?.headers || {}) }
+      })
+    }
+    return res
+  }
 
-  /**
-   * 帮助命令
-   */
-  ctx.command('novel', '小说下载插件')
-    .alias('小说')
-    .action(({ session }) => {
-      const lines: string[] = []
-      lines.push('📚 小说下载插件帮助')
-      lines.push('═'.repeat(30))
-      lines.push('')
-      lines.push('可用命令:')
-      lines.push('  novel.search <关键词>  - 搜索小说')
-      lines.push('  novel.info <ID>        - 查看小说详情')
-      lines.push('  novel.download <ID>    - 下载小说')
-      lines.push('  novel.tasks            - 查看下载任务')
-      lines.push('  novel.clear            - 清理已完成任务')
-      lines.push('')
-      lines.push('下载选项:')
-      lines.push('  -f <格式>    txt 或 epub')
-      lines.push('  -e <编码>    utf-8 或 gbk')
-      lines.push('  -s <章节>    起始章节')
-      lines.push('  -d <章节>    结束章节')
-      lines.push('')
-      lines.push('示例:')
-      lines.push('  novel.search 斗破苍穹')
-      lines.push('  novel.download 7143038691944949011')
-      lines.push('  novel.download 7143038691944949011 -f epub')
-      lines.push('  novel.download 7143038691944949011 -s 1 -d 100')
-      
-      return lines.join('\n')
-    })
+  // 生成图片（可选，需要 puppeteer）
+  async function renderResultsAsImage(items: any[], keyword: string): Promise<Buffer | null> {
+    if (!config.enableImage) return null
+    logDebug('生成图片，条目数:', items.length)
+    try {
+      const browser = await (ctx as any).puppeteer.browser()
+      const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <style>
+          body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; padding: 20px; background: #f5f5f5; }
+          .container { max-width: ${config.imageWidth}px; margin: 0 auto; background: white; border-radius: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
+          .header { background: #2c3e50; color: white; padding: 16px 24px; }
+          .header h2 { margin: 0; font-size: 1.5rem; }
+          .header p { margin: 8px 0 0; opacity: 0.8; font-size: 0.9rem; }
+          table { width: 100%; border-collapse: collapse; }
+          th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid #eee; }
+          th { background: #f8f9fa; font-weight: 600; color: #2c3e50; }
+          tr:hover { background: #f8f9fa; }
+          .book-id { font-family: monospace; font-size: 0.8rem; color: #7f8c8d; }
+          .footer { padding: 12px 24px; background: #f8f9fa; color: #7f8c8d; font-size: 0.8rem; text-align: center; border-top: 1px solid #eee; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h2>🔍 搜索「${escapeHtml(keyword)}」</h2>
+            <p>共找到 ${items.length} 本小说，请回复序号下载</p>
+          </div>
+          <table>
+            <thead><tr><th>序号</th><th>书名</th><th>作者</th><th>小说ID</th></td></thead>
+            <tbody>
+              ${items.map((item, idx) => `
+                <tr>
+                  <td style="font-weight: bold;">${idx+1}</td>
+                  <td>${escapeHtml(item.title)}</td>
+                  <td>${escapeHtml(item.author || '未知')}</td>
+                  <td class="book-id">${item.book_id}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          <div class="footer">💡 使用 tnd 下载 &lt;序号&gt; 下载（例如 tnd 下载 1）</div>
+        </div>
+      </body>
+      </html>`
+      const page = await browser.newPage()
+      await page.setViewport({ width: config.imageWidth!, height: 800 })
+      await page.setContent(html, { waitUntil: 'networkidle0' })
+      const element = await page.$('.container')
+      const screenshot = await element!.screenshot({ type: 'png' })
+      await page.close()
+      return screenshot
+    } catch (e: any) {
+      ctx.logger.error(`图片生成失败: ${e.message}`)
+      return null
+    }
+  }
 
-  // 快捷命令别名
-  ctx.command('n', '小说下载快捷命令')
-    .action(({ session }) => {
-      return '请使用 novel 命令查看帮助，或直接使用:\n' +
-             'n搜索 <关键词> - 搜索小说\n' +
-             'n详情 <ID> - 查看详情\n' +
-             'n下载 <ID> - 下载小说'
-    })
+  function escapeHtml(str: string): string {
+    return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m] || m))
+  }
+
+  const tnd = ctx.command('tnd', '番茄小说下载器')
+
+  // 搜索子命令（中英文别名）
+  const searchCmd = tnd.subcommand('.search <keyword:text>', '搜索小说')
+  searchCmd.alias('.搜索')
+  searchCmd.action(async ({ session }, keyword) => {
+    if (!keyword) return '用法：tnd 搜索 小说名'
+    logDebug(`搜索: ${keyword}`)
+    try {
+      const res = await authedFetch(`/api/search?q=${encodeURIComponent(keyword)}`)
+      if (!res.ok) return `搜索失败 (${res.status})`
+      const data = await res.json()
+      const items = data.items || []
+      if (!items.length) return '没有找到相关小说。'
+      const userId = session?.userId || 'global'
+      searchCache.set(userId, { items, timestamp: Date.now() })
+
+      if (config.enableImage) {
+        const img = await renderResultsAsImage(items.slice(0, 20), keyword)
+        if (img) return h.image(img, 'image/png')
+      }
+
+      let msg = `🔍 找到 ${items.length} 本：\n`
+      items.slice(0, 20).forEach((b: any, i: number) => {
+        msg += `${i+1}. ${b.title} (${b.author || '未知'})\n`
+      })
+      msg += `\n💡 使用 tnd 下载 <序号>`
+      return msg
+    } catch (e: any) {
+      return `搜索失败: ${e.message}`
+    }
+  })
+
+  // 下载子命令（中英文别名）
+  const downloadCmd = tnd.subcommand('.download <target>', '下载小说')
+  downloadCmd.alias('.下载')
+  downloadCmd.action(async ({ session }, target) => {
+    if (!target) return '用法：tnd 下载 <序号> 或 tnd 下载 <book_id>'
+    logDebug(`下载目标: ${target}`)
+
+    let book_id: string | null = null
+    let book_title: string | null = null
+
+    if (/^\d+$/.test(target) && target.length > 15) {
+      book_id = target
+    } else {
+      const userId = session?.userId || 'global'
+      const cached = searchCache.get(userId)
+      if (!cached || Date.now() - cached.timestamp > CACHE_TTL) {
+        return '未找到搜索结果，请先使用 tnd 搜索'
+      }
+      const idx = parseInt(target, 10)
+      if (isNaN(idx) || idx < 1 || idx > cached.items.length) {
+        return `序号无效，请输入 1-${cached.items.length}`
+      }
+      book_id = cached.items[idx-1].book_id
+      book_title = cached.items[idx-1].title
+    }
+    if (!book_id) return '无法获取小说 ID'
+    if (!book_title) return '无法获取书名，请重新搜索'
+
+    try {
+      // 1. 创建下载任务
+      const createRes = await authedFetch('/api/jobs', {
+        method: 'POST',
+        body: JSON.stringify({ book_id })
+      })
+      if (!createRes.ok) return `创建任务失败 (${createRes.status})`
+      const job = await createRes.json()
+      const taskId = job.id || job.data?.id
+      if (!taskId) return `创建失败: ${JSON.stringify(job)}`
+
+      await session?.send(`📥 任务已创建 (ID: ${taskId})，正在下载...`)
+
+      // 2. 等待总计 120 秒
+      const INITIAL_WAIT = 20000   // 20 秒
+      const RETRY_INTERVAL = 5000  // 5 秒
+      const MAX_RETRIES = 20       // 20 次 → 总 20 + 20*5 = 120 秒
+
+      await setTimeout(INITIAL_WAIT)
+
+      // 3. 构造文件链接（格式：{base}/download/书名.txt）
+      const fileName = `${book_title}.txt`
+      const fileUrl = `${base}/download/${encodeURIComponent(fileName)}`
+
+      // 4. 轮询检查文件是否可访问
+      for (let i = 0; i < MAX_RETRIES; i++) {
+        const checkRes = await fetch(fileUrl, { method: 'HEAD' })
+        if (checkRes.ok) {
+          logDebug(`文件已就绪 (尝试 ${i+1} 次)，链接: ${fileUrl}`)
+          return h.file(fileUrl)
+        }
+        logDebug(`文件未就绪 (尝试 ${i+1}/${MAX_RETRIES})，等待 ${RETRY_INTERVAL/1000} 秒...`)
+        await setTimeout(RETRY_INTERVAL)
+      }
+
+      return `下载超时（已等待 120 秒），请稍后手动访问 TND 获取。任务 ID: ${taskId}`
+    } catch (e: any) {
+      ctx.logger.error(`下载异常: ${e.message}`)
+      return `下载失败: ${e.message}`
+    }
+  })
 }
