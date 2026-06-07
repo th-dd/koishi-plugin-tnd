@@ -1,45 +1,32 @@
 {
   "name": "koishi-plugin-novel-downloader",
   "version": "1.0.0",
-  "description": "Koishi小说下载插件 - 支持番茄小说等平台的TXT格式电子书下载",
+  "description": "番茄小说下载器 Koishi 插件",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
-  "author": "Qingyan Agent",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/koishi-plugin-novel-downloader"
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
     "koishi",
     "plugin",
-    "novel",
-    "downloader",
-    "fanqie",
-    "txt",
-    "ebook"
+    "tomato",
+    "novel"
   ],
-  "koishi": {
-    "description": {
-      "zh": "小说下载插件 - 支持番茄小说等平台的TXT格式电子书下载",
-      "en": "Novel Downloader Plugin - Download TXT format ebooks from Fanqie and other platforms"
-    },
-    "service": {
-      "required": ["http"]
-    }
-  },
-  "scripts": {
-    "build": "tsc"
-  },
+  "author": "yourname",
+  "license": "MIT",
   "peerDependencies": {
-    "koishi": "^4.17.0"
+    "koishi": "^4.15.0"
+  },
+  "koishi": {
+    "description": "通过番茄小说下载器 API 实现小说搜索和下载"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
-    "koishi": "^4.17.0",
-    "typescript": "^5.3.0"
-  },
-  "dependencies": {
-    "axios": "^1.6.0"
+    "@types/node": "^20.19.41",
+    "typescript": "^5.9.3"
   }
 }
