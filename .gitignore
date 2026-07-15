@@ -2,8 +2,9 @@
 node_modules/
 
 # Build output
-lib/
+lib/*
 dist/
+*.tgz
 
 # IDE
 .idea/

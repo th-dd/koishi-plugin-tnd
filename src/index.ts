@@ -7,21 +7,51 @@ export const inject = ['puppeteer']
 export interface Config {
   apiBase: string
   apiPassword: string
+  // 搜索结果配置
+  maxSearchResults?: number
+  // 下载等待配置
+  initialWait?: number
+  retryInterval?: number
+  maxFileCheckRetries?: number
+  // 文件发送配置
+  fileSendMaxRetries?: number
+  // 文本截断配置
+  maxTextLength?: number
+  // 功能开关
   enableImage?: boolean
   imageWidth?: number
+  // 调试
   debug?: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
   apiBase: Schema.string().required().description('TND 服务地址，如 http://tnd.th-dd.top'),
   apiPassword: Schema.string().required().description('TND 服务的密码锁密码'),
-  enableImage: Schema.boolean().default(true).description('将搜索结果渲染为图片（需要 koishi-plugin-puppeteer）'),
+  
+  // 搜索结果配置
+  maxSearchResults: Schema.number().default(20).description('搜索结果最大显示数量'),
+  
+  // 下载等待配置（单位：毫秒）
+  initialWait: Schema.number().default(30000).description('创建任务后初始等待时间 (毫秒)'),
+  retryInterval: Schema.number().default(10000).description('文件检查重试间隔 (毫秒)'),
+  maxFileCheckRetries: Schema.number().default(33).description('文件检查最大重试次数'),
+  
+  // 文件发送配置
+  fileSendMaxRetries: Schema.number().default(3).description('文件发送失败最大重试次数'),
+  
+  // 文本截断配置（QQ 适配器可能有消息长度限制）
+  maxTextLength: Schema.number().default(4000).description('单条消息最大字符数'),
+  
+  // 图片功能
+  enableImage: Schema.boolean().default(false).description('将搜索结果渲染为图片（需要 koishi-plugin-puppeteer）'),
   imageWidth: Schema.number().default(800).description('图片宽度'),
+  
+  // 调试
   debug: Schema.boolean().default(false).description('开启调试日志')
 })
 
 const searchCache = new Map<string, { items: any[], timestamp: number }>()
-const CACHE_TTL = 5 * 60 * 1000 // 5分钟
+const CACHE_TTL = 5 * 60 * 1000
 
 export function apply(ctx: Context, config: Config) {
   const base = config.apiBase.replace(/\/$/, '')
@@ -31,7 +61,6 @@ export function apply(ctx: Context, config: Config) {
     if (config.debug) ctx.logger.debug('[DEBUG]', ...args)
   }
 
-  // 登录获取 Cookie
   async function login(): Promise<boolean> {
     if (cookieString) return true
     logDebug('登录 TND:', `${base}/api/login`)
@@ -90,10 +119,8 @@ export function apply(ctx: Context, config: Config) {
     return res
   }
 
-  // 生成图片（可选，需要 puppeteer）
   async function renderResultsAsImage(items: any[], keyword: string): Promise<Buffer | null> {
     if (!config.enableImage) return null
-    logDebug('生成图片，条目数:', items.length)
     try {
       const browser = await (ctx as any).puppeteer.browser()
       const html = `
@@ -122,7 +149,7 @@ export function apply(ctx: Context, config: Config) {
             <p>共找到 ${items.length} 本小说，请回复序号下载</p>
           </div>
           <table>
-            <thead><tr><th>序号</th><th>书名</th><th>作者</th><th>小说ID</th></td></thead>
+            <thead><tr><th>序号</th><th>书名</th><th>作者</th><th>小说ID</th></tr></thead>
             <tbody>
               ${items.map((item, idx) => `
                 <tr>
@@ -155,9 +182,29 @@ export function apply(ctx: Context, config: Config) {
     return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m] || m))
   }
 
+  // 生成 Markdown 表格（适配 QQ 适配器）
+  function generateMarkdownTable(items: any[], keyword: string): string {
+    const maxResults = config.maxSearchResults || 20
+    const showItems = items.slice(0, maxResults)
+    
+    let md = `## 🔍 搜索「${keyword}」\n`
+    md += `> 共找到 ${items.length} 本小说，请回复序号下载\n\n`
+    md += `| 序号 | 书名 | 作者 |\n`
+    md += `|:---:|:---|:---|\n`
+    showItems.forEach((item, idx) => {
+      const title = item.title.length > 15 ? item.title.slice(0, 15) + '…' : item.title
+      const author = item.author || '未知'
+      md += `| ${idx+1} | ${title} | ${author} |\n`
+    })
+    if (items.length > maxResults) {
+      md += `\n> ⚠️ 仅展示前 ${maxResults} 本，更多结果请缩小关键词范围`
+    }
+    md += `\n\n💡 使用 \`tnd 下载 <序号>\` 下载`
+    return md
+  }
+
   const tnd = ctx.command('tnd', '番茄小说下载器')
 
-  // 搜索子命令（中英文别名）
   const searchCmd = tnd.subcommand('.search <keyword:text>', '搜索小说')
   searchCmd.alias('.搜索')
   searchCmd.action(async ({ session }, keyword) => {
@@ -172,23 +219,30 @@ export function apply(ctx: Context, config: Config) {
       const userId = session?.userId || 'global'
       searchCache.set(userId, { items, timestamp: Date.now() })
 
+      // 优先使用图片输出
       if (config.enableImage) {
-        const img = await renderResultsAsImage(items.slice(0, 20), keyword)
+        const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
         if (img) return h.image(img, 'image/png')
       }
 
-      let msg = `🔍 找到 ${items.length} 本：\n`
-      items.slice(0, 20).forEach((b: any, i: number) => {
-        msg += `${i+1}. ${b.title} (${b.author || '未知'})\n`
-      })
-      msg += `\n💡 使用 tnd 下载 <序号>`
-      return msg
+      // 尝试 Markdown 输出（QQ 适配器支持）
+      try {
+        const md = generateMarkdownTable(items, keyword)
+        return h('message', { type: 'markdown' }, md)
+      } catch {
+        // Markdown 不支持，降级为纯文本
+        let msg = `🔍 找到 ${items.length} 本：\n`
+        items.slice(0, config.maxSearchResults || 20).forEach((b: any, i: number) => {
+          msg += `${i+1}. ${b.title} (${b.author || '未知'})\n`
+        })
+        msg += `\n💡 使用 tnd 下载 <序号>`
+        return msg
+      }
     } catch (e: any) {
       return `搜索失败: ${e.message}`
     }
   })
 
-  // 下载子命令（中英文别名）
   const downloadCmd = tnd.subcommand('.download <target>', '下载小说')
   downloadCmd.alias('.下载')
   downloadCmd.action(async ({ session }, target) => {
@@ -217,7 +271,6 @@ export function apply(ctx: Context, config: Config) {
     if (!book_title) return '无法获取书名，请重新搜索'
 
     try {
-      // 1. 创建下载任务
       const createRes = await authedFetch('/api/jobs', {
         method: 'POST',
         body: JSON.stringify({ book_id })
@@ -229,29 +282,73 @@ export function apply(ctx: Context, config: Config) {
 
       await session?.send(`📥 任务已创建 (ID: ${taskId})，正在下载...`)
 
-      // 2. 等待总计 120 秒
-      const INITIAL_WAIT = 20000   // 20 秒
-      const RETRY_INTERVAL = 5000  // 5 秒
-      const MAX_RETRIES = 20       // 20 次 → 总 20 + 20*5 = 120 秒
+      const INITIAL_WAIT = config.initialWait || 30000
+      const RETRY_INTERVAL = config.retryInterval || 10000
+      const MAX_RETRIES = config.maxFileCheckRetries || 33
 
       await setTimeout(INITIAL_WAIT)
 
-      // 3. 构造文件链接（格式：{base}/download/书名.txt）
       const fileName = `${book_title}.txt`
       const fileUrl = `${base}/download/${encodeURIComponent(fileName)}`
 
-      // 4. 轮询检查文件是否可访问
       for (let i = 0; i < MAX_RETRIES; i++) {
-        const checkRes = await fetch(fileUrl, { method: 'HEAD' })
-        if (checkRes.ok) {
-          logDebug(`文件已就绪 (尝试 ${i+1} 次)，链接: ${fileUrl}`)
-          return h.file(fileUrl)
+        try {
+          const checkRes = await fetch(fileUrl, {
+            method: 'HEAD',
+            headers: { Cookie: cookieString || '' }
+          })
+          
+          if (checkRes.ok) {
+            logDebug(`文件已就绪 (尝试 ${i+1} 次)`)
+            
+            const fileRes = await fetch(fileUrl, {
+              headers: { Cookie: cookieString || '' }
+            })
+            
+            if (!fileRes.ok) {
+              return `下载文件失败 (HTTP ${fileRes.status})`
+            }
+            
+            const arrayBuffer = await fileRes.arrayBuffer()
+            const buffer = Buffer.from(arrayBuffer)
+
+            // ========== 先发文字说下载完成 ==========
+            await session?.send(`✅ 小说「${book_title}」下载完成！正在发送文件...`)
+
+            // ========== 发送文件（带重试机制，使用 Buffer 方式，兼容 OneBot 和 QQ 适配器） ==========
+            const maxRetries = config.fileSendMaxRetries || 3
+            let lastError: any = null
+            for (let retry = 0; retry < maxRetries; retry++) {
+              try {
+                if (retry > 0) {
+                  logDebug(`文件发送重试第 ${retry} 次...`)
+                  await setTimeout(3000)
+                }
+                // 使用 Buffer 方式发送，兼容性最好
+                return h.file(buffer, 'text/plain', {
+                  name: `tnd-${book_title}-${book_id}.txt`
+                })
+              } catch (e: any) {
+                lastError = e
+                logDebug(`文件发送失败 (尝试 ${retry + 1}/${maxRetries}): ${e.message}`)
+                if (retry < maxRetries - 1) {
+                  await setTimeout(5000)
+                }
+              }
+            }
+            
+            return `❌ 文件发送失败（已重试 ${maxRetries} 次），请稍后重试。错误: ${lastError?.message || '未知错误'}`
+          }
+          
+          logDebug(`文件未就绪 (尝试 ${i+1}/${MAX_RETRIES})，状态码: ${checkRes.status}`)
+        } catch (e: any) {
+          logDebug(`检查文件异常: ${e.message}`)
         }
-        logDebug(`文件未就绪 (尝试 ${i+1}/${MAX_RETRIES})，等待 ${RETRY_INTERVAL/1000} 秒...`)
+        
         await setTimeout(RETRY_INTERVAL)
       }
 
-      return `下载超时（已等待 120 秒），请稍后手动访问 TND 获取。任务 ID: ${taskId}`
+      return `下载超时（已等待 ${(INITIAL_WAIT + MAX_RETRIES * RETRY_INTERVAL) / 1000} 秒），请稍后手动访问 TND 获取。任务 ID: ${taskId}`
     } catch (e: any) {
       ctx.logger.error(`下载异常: ${e.message}`)
       return `下载失败: ${e.message}`
