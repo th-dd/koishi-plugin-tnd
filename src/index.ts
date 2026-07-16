@@ -7,46 +7,28 @@ export const inject = ['puppeteer']
 export interface Config {
   apiBase: string
   apiPassword: string
-  // 搜索结果配置
   maxSearchResults?: number
-  // 下载等待配置
   initialWait?: number
   retryInterval?: number
   maxFileCheckRetries?: number
-  // 文件发送配置
   fileSendMaxRetries?: number
-  // 文本截断配置
   maxTextLength?: number
-  // 功能开关
   enableImage?: boolean
   imageWidth?: number
-  // 调试
   debug?: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
   apiBase: Schema.string().required().description('TND 服务地址，如 http://tnd.th-dd.top'),
   apiPassword: Schema.string().required().description('TND 服务的密码锁密码'),
-  
-  // 搜索结果配置
   maxSearchResults: Schema.number().default(20).description('搜索结果最大显示数量'),
-  
-  // 下载等待配置（单位：毫秒）
   initialWait: Schema.number().default(30000).description('创建任务后初始等待时间 (毫秒)'),
   retryInterval: Schema.number().default(10000).description('文件检查重试间隔 (毫秒)'),
   maxFileCheckRetries: Schema.number().default(33).description('文件检查最大重试次数'),
-  
-  // 文件发送配置
   fileSendMaxRetries: Schema.number().default(3).description('文件发送失败最大重试次数'),
-  
-  // 文本截断配置（QQ 适配器可能有消息长度限制）
   maxTextLength: Schema.number().default(4000).description('单条消息最大字符数'),
-  
-  // 图片功能
   enableImage: Schema.boolean().default(false).description('将搜索结果渲染为图片（需要 koishi-plugin-puppeteer）'),
   imageWidth: Schema.number().default(800).description('图片宽度'),
-  
-  // 调试
   debug: Schema.boolean().default(false).description('开启调试日志')
 })
 
@@ -59,6 +41,38 @@ export function apply(ctx: Context, config: Config) {
 
   function logDebug(...args: any[]) {
     if (config.debug) ctx.logger.debug('[DEBUG]', ...args)
+  }
+
+  // ========== 检测适配器类型 ==========
+  function getAdapterType(session: any): string {
+    const platform = session?.platform || 'unknown'
+    const adapter = session?.adapter || ''
+    const platformLower = platform.toLowerCase()
+    const adapterLower = adapter.toLowerCase()
+    
+    if (platformLower.includes('crack') || adapterLower.includes('crack')) {
+      return 'qq_crack'
+    }
+    
+    if (platformLower.includes('onebot') || adapterLower.includes('onebot') || 
+        platformLower.includes('llonebot') || platformLower.includes('napcat') ||
+        platformLower.includes('llob')) {
+      return 'onebot'
+    }
+    
+    if (platformLower.includes('qq') || adapterLower.includes('qq')) {
+      return 'qq'
+    }
+    
+    if (platformLower.includes('telegram') || adapterLower.includes('telegram')) {
+      return 'telegram'
+    }
+    
+    if (platformLower.includes('discord') || adapterLower.includes('discord')) {
+      return 'discord'
+    }
+    
+    return 'unknown'
   }
 
   async function login(): Promise<boolean> {
@@ -182,13 +196,28 @@ export function apply(ctx: Context, config: Config) {
     return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m] || m))
   }
 
-  // 生成 Markdown 表格（适配 QQ 适配器）
-  function generateMarkdownTable(items: any[], keyword: string): string {
+  function generateTextResult(items: any[], keyword: string): string {
+    const maxResults = config.maxSearchResults || 20
+    const showItems = items.slice(0, maxResults)
+    let msg = `🔍 搜索「${keyword}」找到 ${items.length} 本：\n\n`
+    showItems.forEach((b: any, i: number) => {
+      msg += `${i+1}. ${b.title}\n`
+      if (b.author) msg += `   作者：${b.author}\n`
+      msg += `   ID: ${b.book_id}\n\n`
+    })
+    if (items.length > maxResults) {
+      msg += `... 仅展示前 ${maxResults} 本。\n`
+    }
+    msg += `💡 使用 tnd 下载 <序号> 下载（例如 tnd 下载 1）`
+    return msg
+  }
+
+  function generateMarkdownResult(items: any[], keyword: string): any {
     const maxResults = config.maxSearchResults || 20
     const showItems = items.slice(0, maxResults)
     
     let md = `## 🔍 搜索「${keyword}」\n`
-    md += `> 共找到 ${items.length} 本小说，请回复序号下载\n\n`
+    md += `> 共找到 ${items.length} 本小说\n\n`
     md += `| 序号 | 书名 | 作者 |\n`
     md += `|:---:|:---|:---|\n`
     showItems.forEach((item, idx) => {
@@ -197,19 +226,203 @@ export function apply(ctx: Context, config: Config) {
       md += `| ${idx+1} | ${title} | ${author} |\n`
     })
     if (items.length > maxResults) {
-      md += `\n> ⚠️ 仅展示前 ${maxResults} 本，更多结果请缩小关键词范围`
+      md += `\n> ⚠️ 仅展示前 ${maxResults} 本`
     }
-    md += `\n\n💡 使用 \`tnd 下载 <序号>\` 下载`
+    md += `\n\n💡 回复 \`tnd 下载 <序号>\` 下载`
     return md
+  }
+
+  function generateQuickReplyButtons(items: any[]): any[] {
+    const maxResults = Math.min(config.maxSearchResults || 10, 10)
+    const showItems = items.slice(0, maxResults)
+    
+    const rows: any[] = []
+    let currentRow: any[] = []
+    
+    showItems.forEach((item, idx) => {
+      const label = `${idx+1}.${item.title.length > 6 ? item.title.slice(0, 6) + '…' : item.title}`
+      currentRow.push({
+        label: label,
+        text: `tnd 下载 ${idx+1}`,
+        type: 'plain'
+      })
+      if (currentRow.length >= 5) {
+        rows.push(currentRow)
+        currentRow = []
+      }
+    })
+    if (currentRow.length > 0) {
+      rows.push(currentRow)
+    }
+    
+    return rows
+  }
+
+  // ========== 获取 OneBot 适配器实例 ==========
+  function getOneBotAdapter(session: any): any {
+    try {
+      const bot = session.bot as any
+      if (bot?.onebot) {
+        return bot.onebot
+      }
+    } catch (e) { /* ignore */ }
+    
+    try {
+      const bots = ctx.bots as any
+      if (bots && typeof bots.forEach === 'function') {
+        let found: any = null
+        bots.forEach((bot: any) => {
+          const platform = bot.platform || ''
+          if (platform.toLowerCase().includes('onebot') || 
+              platform.toLowerCase().includes('llonebot') ||
+              platform.toLowerCase().includes('napcat')) {
+            if (bot.onebot) found = bot.onebot
+          }
+        })
+        if (found) return found
+      }
+    } catch (e) { /* ignore */ }
+    
+    try {
+      const bots = ctx.bots as any
+      if (bots && typeof bots.get === 'function') {
+        const bot = bots.get(session.platform)
+        if (bot?.onebot) return bot.onebot
+      }
+    } catch (e) { /* ignore */ }
+    
+    return null
+  }
+
+  // ========== 清理文件名（移除非法字符） ==========
+  function sanitizeFileName(name: string): string {
+    // 移除 Windows/Linux 文件名非法字符
+    return name.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_')
+  }
+
+  // ========== 多平台文件发送核心函数 ==========
+  async function sendFile(session: any, buffer: Buffer, fileName: string): Promise<any> {
+    const adapterType = getAdapterType(session)
+    const maxRetries = config.fileSendMaxRetries || 3
+    let lastError: any = null
+
+    // 清理文件名
+    const cleanFileName = sanitizeFileName(fileName)
+    logDebug(`原始文件名: ${fileName}, 清理后: ${cleanFileName}`)
+
+    // 检查文件大小 (QQ 官方限制 100MB，但建议更小)
+    const fileSizeMB = buffer.length / (1024 * 1024)
+    if (fileSizeMB > 50) {
+      logDebug(`文件较大 (${fileSizeMB.toFixed(1)}MB)，可能会上传失败`)
+    }
+
+    for (let retry = 0; retry < maxRetries; retry++) {
+      try {
+        if (retry > 0) {
+          logDebug(`文件发送重试第 ${retry} 次...`)
+          await setTimeout(3000)
+        }
+
+        // ===== OneBot 适配器：直接调用 API =====
+        if (adapterType === 'onebot') {
+          const base64Data = buffer.toString('base64')
+          logDebug(`OneBot 发送文件，大小: ${(buffer.length / 1024).toFixed(1)}KB`)
+          
+          const onebot = getOneBotAdapter(session)
+          if (!onebot) {
+            logDebug('未找到 OneBot 适配器，使用 h.file 备用方案')
+            return h.file(buffer, 'text/plain', { name: cleanFileName })
+          }
+
+          const channelId = session.channelId || ''
+          const isPrivate = channelId.startsWith('private:') || channelId.startsWith('private_') || channelId.includes('private')
+          
+          let result: any
+          if (isPrivate) {
+            const userId = channelId.replace(/^private[:_]/, '').replace(/[^0-9]/g, '')
+            const targetId = parseInt(userId) || session.userId
+            logDebug(`私聊发送，用户: ${targetId}`)
+            // OneBot v11 send_private_file 参数
+            result = await onebot._request('send_private_file', {
+              user_id: typeof targetId === 'string' ? parseInt(targetId) : targetId,
+              file: base64Data,
+              name: cleanFileName
+            })
+          } else {
+            const groupId = parseInt(channelId)
+            if (isNaN(groupId)) {
+              throw new Error(`无效的群号: ${channelId}`)
+            }
+            logDebug(`群聊发送，群号: ${groupId}`)
+            // OneBot v11 upload_group_file 参数
+            result = await onebot._request('upload_group_file', {
+              group_id: groupId,
+              file: base64Data,
+              name: cleanFileName
+            })
+          }
+          
+          logDebug(`OneBot API 调用成功`)
+          return `✅ 文件「${cleanFileName}」已发送。`
+        }
+
+        // ===== QQ 官方适配器 =====
+        if (adapterType === 'qq') {
+          logDebug(`QQ 官方适配器发送文件，大小: ${(buffer.length / 1024).toFixed(1)}KB`)
+          
+          // QQ 官方适配器对文件大小有限制，如果太大则分片或使用其他方式
+          // 注意：QQ 官方适配器使用 h.file 时，文件名需要正确传递
+          return h.file(buffer, 'text/plain', { 
+            name: cleanFileName,
+            // QQ 适配器可能需要指定 type
+            type: 'file'
+          })
+        }
+
+        // ===== QQ Crack =====
+        if (adapterType === 'qq_crack') {
+          logDebug(`QQ Crack 适配器发送文件`)
+          return h.file(buffer, 'text/plain', { name: cleanFileName })
+        }
+
+        // ===== Telegram =====
+        if (adapterType === 'telegram') {
+          logDebug(`Telegram 发送文件`)
+          return h.file(buffer, 'text/plain', { name: cleanFileName })
+        }
+
+        // ===== Discord =====
+        if (adapterType === 'discord') {
+          logDebug(`Discord 发送文件`)
+          return h.file(buffer, 'text/plain', { name: cleanFileName })
+        }
+
+        // ===== 未知适配器 =====
+        logDebug(`未知适配器，使用 Buffer 方式发送`)
+        return h.file(buffer, 'text/plain', { name: cleanFileName })
+
+      } catch (e: any) {
+        lastError = e
+        logDebug(`文件发送失败 (尝试 ${retry + 1}/${maxRetries}): ${e.message}`)
+        if (retry < maxRetries - 1) {
+          await setTimeout(5000)
+        }
+      }
+    }
+
+    throw lastError || new Error('文件发送失败')
   }
 
   const tnd = ctx.command('tnd', '番茄小说下载器')
 
+  // ========== 搜索命令 ==========
   const searchCmd = tnd.subcommand('.search <keyword:text>', '搜索小说')
   searchCmd.alias('.搜索')
   searchCmd.action(async ({ session }, keyword) => {
     if (!keyword) return '用法：tnd 搜索 小说名'
     logDebug(`搜索: ${keyword}`)
+    logDebug(`适配器类型: ${getAdapterType(session)}`)
+    
     try {
       const res = await authedFetch(`/api/search?q=${encodeURIComponent(keyword)}`)
       if (!res.ok) return `搜索失败 (${res.status})`
@@ -219,30 +432,85 @@ export function apply(ctx: Context, config: Config) {
       const userId = session?.userId || 'global'
       searchCache.set(userId, { items, timestamp: Date.now() })
 
-      // 优先使用图片输出
+      const adapterType = getAdapterType(session)
+
+      if (adapterType === 'onebot') {
+        logDebug('使用 OneBot 响应策略')
+        if (config.enableImage) {
+          const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
+          if (img) {
+            return h.image(img, 'image/png')
+          }
+        }
+        return generateTextResult(items, keyword)
+      }
+
+      if (adapterType === 'qq' || adapterType === 'qq_crack') {
+        logDebug('使用 QQ 响应策略')
+        if (config.enableImage) {
+          const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
+          if (img) {
+            return h.image(img, 'image/png')
+          }
+        }
+        try {
+          const md = generateMarkdownResult(items, keyword)
+          const buttons = generateQuickReplyButtons(items)
+          if (buttons.length > 0) {
+            return h('message', { type: 'markdown' }, md, h('keyboard', { rows: buttons }))
+          }
+          return h('message', { type: 'markdown' }, md)
+        } catch (e) {
+          logDebug(`Markdown 失败，降级: ${(e as any).message}`)
+        }
+        try {
+          const text = generateTextResult(items, keyword)
+          const buttons = generateQuickReplyButtons(items)
+          if (buttons.length > 0) {
+            return h('message', text, h('keyboard', { rows: buttons }))
+          }
+          return text
+        } catch (e) {
+          return generateTextResult(items, keyword)
+        }
+      }
+
+      if (adapterType === 'telegram') {
+        logDebug('使用 Telegram 响应策略')
+        if (config.enableImage) {
+          const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
+          if (img) return h.image(img, 'image/png')
+        }
+        try {
+          const md = generateMarkdownResult(items, keyword)
+          return h('message', { type: 'markdown' }, md)
+        } catch {
+          return generateTextResult(items, keyword)
+        }
+      }
+
+      if (adapterType === 'discord') {
+        logDebug('使用 Discord 响应策略')
+        if (config.enableImage) {
+          const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
+          if (img) return h.image(img, 'image/png')
+        }
+        return generateTextResult(items, keyword)
+      }
+
+      logDebug('使用未知适配器响应策略')
       if (config.enableImage) {
         const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
         if (img) return h.image(img, 'image/png')
       }
+      return generateTextResult(items, keyword)
 
-      // 尝试 Markdown 输出（QQ 适配器支持）
-      try {
-        const md = generateMarkdownTable(items, keyword)
-        return h('message', { type: 'markdown' }, md)
-      } catch {
-        // Markdown 不支持，降级为纯文本
-        let msg = `🔍 找到 ${items.length} 本：\n`
-        items.slice(0, config.maxSearchResults || 20).forEach((b: any, i: number) => {
-          msg += `${i+1}. ${b.title} (${b.author || '未知'})\n`
-        })
-        msg += `\n💡 使用 tnd 下载 <序号>`
-        return msg
-      }
     } catch (e: any) {
       return `搜索失败: ${e.message}`
     }
   })
 
+  // ========== 下载命令 ==========
   const downloadCmd = tnd.subcommand('.download <target>', '下载小说')
   downloadCmd.alias('.下载')
   downloadCmd.action(async ({ session }, target) => {
@@ -312,32 +580,16 @@ export function apply(ctx: Context, config: Config) {
             const arrayBuffer = await fileRes.arrayBuffer()
             const buffer = Buffer.from(arrayBuffer)
 
-            // ========== 先发文字说下载完成 ==========
             await session?.send(`✅ 小说「${book_title}」下载完成！正在发送文件...`)
 
-            // ========== 发送文件（带重试机制，使用 Buffer 方式，兼容 OneBot 和 QQ 适配器） ==========
-            const maxRetries = config.fileSendMaxRetries || 3
-            let lastError: any = null
-            for (let retry = 0; retry < maxRetries; retry++) {
-              try {
-                if (retry > 0) {
-                  logDebug(`文件发送重试第 ${retry} 次...`)
-                  await setTimeout(3000)
-                }
-                // 使用 Buffer 方式发送，兼容性最好
-                return h.file(buffer, 'text/plain', {
-                  name: `tnd-${book_title}-${book_id}.txt`
-                })
-              } catch (e: any) {
-                lastError = e
-                logDebug(`文件发送失败 (尝试 ${retry + 1}/${maxRetries}): ${e.message}`)
-                if (retry < maxRetries - 1) {
-                  await setTimeout(5000)
-                }
-              }
-            }
+            // 文件名格式: 书名_小说ID.txt
+            const fileNameWithId = `${book_title}_${book_id}.txt`
             
-            return `❌ 文件发送失败（已重试 ${maxRetries} 次），请稍后重试。错误: ${lastError?.message || '未知错误'}`
+            try {
+              return await sendFile(session, buffer, fileNameWithId)
+            } catch (e: any) {
+              return `❌ 文件发送失败，请稍后重试。错误: ${e.message}`
+            }
           }
           
           logDebug(`文件未就绪 (尝试 ${i+1}/${MAX_RETRIES})，状态码: ${checkRes.status}`)

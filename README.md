@@ -27,6 +27,18 @@ plugins:
 | `novel.download <ID>` | 下载小说 |
 | `novel.tasks` | 查看任务 |
 
+## 开发
+
+```shell
+
+npm i # 安装依赖
+
+npm run build && npm pack # 构建产物
+
+# yarn add ./koishi-plugin-novel-downloader-<x.x.x>.tgz # 进入容器
+
+```
+
 ## 示例
 
 ```
