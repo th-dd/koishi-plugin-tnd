@@ -92,7 +92,14 @@ npm version patch          # 或 minor / major
 git push --follow-tags
 ```
 
-工作流会先校验 tag 与 `package.json` 版本一致，再跑 `typecheck` + `npm test`，最后带 provenance 发布。
+工作流会先校验 tag 与 `package.json` 版本一致，再跑 `typecheck` + `npm test`，然后带 provenance 发 npmjs，最后以 `@th-dd/koishi-plugin-novel-downloader` 这个作用域名同步一份到 GitHub Packages。
+
+需要仓库 Secrets 里配 `NPM_TOKEN`（Granular token，Read and write + Bypass 2FA + 仅限本包）。GitHub Packages 用内置 `GITHUB_TOKEN`，装在别处时：
+
+```bash
+yarn config set 'npmScopes.th-dd.npmRegistryServer' https://npm.pkg.github.com
+yarn add @th-dd/koishi-plugin-novel-downloader
+```
 
 ## License
 
