@@ -83,6 +83,17 @@ yarn add ./koishi-plugin-novel-downloader-2.0.0.tgz   # 装进容器
 测试说明：`test/local.cjs` 起一个本地 TND mock 服务，用真实 Koishi App + mock 适配器把插件按命令跑一遍，
 覆盖搜索、预览、按序号/ID 下载、加锁鉴权、失败透传、并发/冷却、格式选择、散装打包、超时取消和任务清理。
 
+## 发布
+
+打 tag 即触发 GitHub Actions 发布到 npm（`NPM_TOKEN` 为带 Bypass 2FA 的 Granular token，放在仓库 Secrets 里）：
+
+```bash
+npm version patch          # 或 minor / major
+git push --follow-tags
+```
+
+工作流会先校验 tag 与 `package.json` 版本一致，再跑 `typecheck` + `npm test`，最后带 provenance 发布。
+
 ## License
 
 MIT
