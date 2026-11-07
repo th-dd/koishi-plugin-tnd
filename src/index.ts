@@ -1,609 +1,408 @@
 import { Context, Schema, h } from 'koishi'
-import { setTimeout } from 'timers/promises'
+import { setTimeout as sleep } from 'timers/promises'
+import { TndApi, TndError } from './api'
+import type { BookItem, Job, Preview, TndConfig } from './types'
+import {
+  formatBytes,
+  imageElement,
+  markdownResult,
+  previewText,
+  qqMarkdownMessage,
+  quickReplies,
+  renderPreviewImage,
+  renderSearchImage,
+  responseMode,
+  sendLong,
+  textResult,
+} from './render'
+import { sendNovelFile } from './transfer'
 
-export const name = 'tomato-downloader'
-export const inject = ['puppeteer']
+export const name = 'novel-downloader'
+// puppeteer 是可选依赖：装了就能出图，没装自动降级为文字。
+// 这里不 declare module 覆盖 Context.puppeteer，避免和 koishi-plugin-puppeteer 的类型冲突。
+export const inject = { required: [], optional: ['puppeteer'] }
 
-export interface Config {
-  apiBase: string
-  apiPassword: string
-  maxSearchResults?: number
-  initialWait?: number
-  retryInterval?: number
-  maxFileCheckRetries?: number
-  fileSendMaxRetries?: number
-  maxTextLength?: number
-  enableImage?: boolean
-  imageWidth?: number
-  debug?: boolean
-}
+export interface Config extends TndConfig {}
 
 export const Config: Schema<Config> = Schema.object({
-  apiBase: Schema.string().required().description('TND 服务地址，如 http://tnd.th-dd.top'),
-  apiPassword: Schema.string().required().description('TND 服务的密码锁密码'),
-  maxSearchResults: Schema.number().default(20).description('搜索结果最大显示数量'),
-  initialWait: Schema.number().default(30000).description('创建任务后初始等待时间 (毫秒)'),
-  retryInterval: Schema.number().default(10000).description('文件检查重试间隔 (毫秒)'),
-  maxFileCheckRetries: Schema.number().default(33).description('文件检查最大重试次数'),
-  fileSendMaxRetries: Schema.number().default(3).description('文件发送失败最大重试次数'),
-  maxTextLength: Schema.number().default(4000).description('单条消息最大字符数'),
+  apiBase: Schema.string().required().description('TND 服务地址，如 https://tnd.th-dd.top'),
+  apiPassword: Schema.string().description('TND 服务密码锁密码，服务未加锁时留空'),
+  maxSearchResults: Schema.number().default(20).min(1).max(50).description('搜索结果最大显示数量'),
+  initialWait: Schema.number().default(8000).description('创建任务后首次轮询前的等待时间 (毫秒)'),
+  pollInterval: Schema.number().default(5000).description('任务进度轮询间隔 (毫秒)'),
+  jobTimeout: Schema.number().default(600000).description('单个任务最长等待时间 (毫秒)'),
+  fileSendMaxRetries: Schema.number().default(3).min(1).description('文件发送失败最大重试次数'),
+  transferMode: Schema.union([
+    Schema.const('auto').description('有密码锁时走临时文件，否则直接传下载直链'),
+    Schema.const('url').description('把 TND 下载直链交给适配器自行下载（省流量）'),
+    Schema.const('file').description('先下载到临时文件再上传（兼容性最好）'),
+    Schema.const('base64').description('转成 base64:// 交给适配器（大文件吃内存）'),
+  ] as const).default('auto').description('文件传输方式'),
+  cleanupJob: Schema.boolean().default(true).description('下载完成后删除服务端任务记录（文件保留）'),
+  quickDownload: Schema.boolean().default(true).description('搜索后直接回复数字即可下载'),
+  cooldown: Schema.number().default(15).description('同一用户两条下载命令的最小间隔 (秒)，0 关闭'),
+  maxConcurrentJobs: Schema.number().default(3).min(1).description('全局同时进行的下载任务上限'),
+  maxTextLength: Schema.number().default(1800).min(200).description('单条消息最大字符数'),
   enableImage: Schema.boolean().default(false).description('将搜索结果渲染为图片（需要 koishi-plugin-puppeteer）'),
   imageWidth: Schema.number().default(800).description('图片宽度'),
-  debug: Schema.boolean().default(false).description('开启调试日志')
+  debug: Schema.boolean().default(false).description('开启调试日志'),
 })
 
-const searchCache = new Map<string, { items: any[], timestamp: number }>()
-const CACHE_TTL = 5 * 60 * 1000
+const CACHE_TTL = 10 * 60 * 1000
+const CACHE_LIMIT = 200
+const PROGRESS_NOTIFY_INTERVAL = 10_000
+const FILE_EXT = ['txt', 'epub', 'pdf', 'zip']
 
 export function apply(ctx: Context, config: Config) {
-  const base = config.apiBase.replace(/\/$/, '')
-  let cookieString: string | null = null
+  const api = new TndApi(ctx, config)
+  const searchCache = new Map<string, { items: BookItem[]; at: number }>()
+  const previewCache = new Map<string, { preview: Preview; at: number }>()
+  const lastUsed = new Map<string, number>()
+  const perUserJobs = new Map<string, number>()
+  // 用户 -> 正在跑的任务，供 tnd 取消 使用
+  const activeJobs = new Map<string, { id: number; cancelled: boolean }>()
+  let runningJobs = 0
 
-  function logDebug(...args: any[]) {
-    if (config.debug) ctx.logger.debug('[DEBUG]', ...args)
+  // 便于在日志里确认插件只加载了一份、指向哪个服务
+  ctx.logger.info('novel-downloader 已加载 → %s', api.base)
+
+  // 容器默认只输出 INFO 及以上，调试开关必须走 info 才看得见
+  const debug = (...args: any[]) => {
+    if (config.debug) ctx.logger.info('[tnd]', ...args)
   }
 
-  // ========== 检测适配器类型 ==========
-  function getAdapterType(session: any): string {
-    const platform = session?.platform || 'unknown'
-    const adapter = session?.adapter || ''
-    const platformLower = platform.toLowerCase()
-    const adapterLower = adapter.toLowerCase()
-    
-    if (platformLower.includes('crack') || adapterLower.includes('crack')) {
-      return 'qq_crack'
-    }
-    
-    if (platformLower.includes('onebot') || adapterLower.includes('onebot') || 
-        platformLower.includes('llonebot') || platformLower.includes('napcat') ||
-        platformLower.includes('llob')) {
-      return 'onebot'
-    }
-    
-    if (platformLower.includes('qq') || adapterLower.includes('qq')) {
-      return 'qq'
-    }
-    
-    if (platformLower.includes('telegram') || adapterLower.includes('telegram')) {
-      return 'telegram'
-    }
-    
-    if (platformLower.includes('discord') || adapterLower.includes('discord')) {
-      return 'discord'
-    }
-    
-    return 'unknown'
+  function cacheSet<T>(map: Map<string, { at: number } & T>, key: string, value: T) {
+    map.delete(key)
+    map.set(key, { ...value, at: Date.now() })
+    while (map.size > CACHE_LIMIT) map.delete(map.keys().next().value!)
   }
 
-  async function login(): Promise<boolean> {
-    if (cookieString) return true
-    logDebug('登录 TND:', `${base}/api/login`)
-    try {
-      const res = await fetch(`${base}/api/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: config.apiPassword })
-      })
-      if (res.status === 200) {
-        const setCookies = res.headers.getSetCookie?.() || []
-        if (setCookies.length) {
-          cookieString = setCookies.map(c => c.split(';')[0]).join('; ')
-        } else {
-          const single = res.headers.get('set-cookie')
-          if (single) cookieString = single
-        }
-        ctx.logger.info('TND 登录成功')
-        return true
-      }
-      ctx.logger.error(`登录失败: ${res.status}`)
-      return false
-    } catch (e: any) {
-      ctx.logger.error(`登录异常: ${e.message}`)
-      return false
-    }
-  }
-
-  function getHeaders(): Record<string, string> {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (cookieString) headers['Cookie'] = cookieString
-    return headers
-  }
-
-  async function authedFetch(path: string, options?: RequestInit, retry = 3): Promise<Response> {
-    if (!cookieString) await login()
-    let res = await fetch(`${base}${path}`, {
-      ...options,
-      headers: { ...getHeaders(), ...(options?.headers || {}) }
-    })
-    if (res.status === 429 && retry > 0) {
-      const wait = parseInt(res.headers.get('Retry-After') || '15') * 1000
-      ctx.logger.warn(`限流，等待 ${wait/1000}s`)
-      await setTimeout(wait)
-      return authedFetch(path, options, retry - 1)
-    }
-    if (res.status === 401 && cookieString) {
-      ctx.logger.warn('Cookie 失效，重新登录')
-      cookieString = null
-      await login()
-      return fetch(`${base}${path}`, {
-        ...options,
-        headers: { ...getHeaders(), ...(options?.headers || {}) }
-      })
-    }
-    return res
-  }
-
-  async function renderResultsAsImage(items: any[], keyword: string): Promise<Buffer | null> {
-    if (!config.enableImage) return null
-    try {
-      const browser = await (ctx as any).puppeteer.browser()
-      const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8">
-        <style>
-          body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; padding: 20px; background: #f5f5f5; }
-          .container { max-width: ${config.imageWidth}px; margin: 0 auto; background: white; border-radius: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
-          .header { background: #2c3e50; color: white; padding: 16px 24px; }
-          .header h2 { margin: 0; font-size: 1.5rem; }
-          .header p { margin: 8px 0 0; opacity: 0.8; font-size: 0.9rem; }
-          table { width: 100%; border-collapse: collapse; }
-          th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid #eee; }
-          th { background: #f8f9fa; font-weight: 600; color: #2c3e50; }
-          tr:hover { background: #f8f9fa; }
-          .book-id { font-family: monospace; font-size: 0.8rem; color: #7f8c8d; }
-          .footer { padding: 12px 24px; background: #f8f9fa; color: #7f8c8d; font-size: 0.8rem; text-align: center; border-top: 1px solid #eee; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header">
-            <h2>🔍 搜索「${escapeHtml(keyword)}」</h2>
-            <p>共找到 ${items.length} 本小说，请回复序号下载</p>
-          </div>
-          <table>
-            <thead><tr><th>序号</th><th>书名</th><th>作者</th><th>小说ID</th></tr></thead>
-            <tbody>
-              ${items.map((item, idx) => `
-                <tr>
-                  <td style="font-weight: bold;">${idx+1}</td>
-                  <td>${escapeHtml(item.title)}</td>
-                  <td>${escapeHtml(item.author || '未知')}</td>
-                  <td class="book-id">${item.book_id}</td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-          <div class="footer">💡 使用 tnd 下载 &lt;序号&gt; 下载（例如 tnd 下载 1）</div>
-        </div>
-      </body>
-      </html>`
-      const page = await browser.newPage()
-      await page.setViewport({ width: config.imageWidth!, height: 800 })
-      await page.setContent(html, { waitUntil: 'networkidle0' })
-      const element = await page.$('.container')
-      const screenshot = await element!.screenshot({ type: 'png' })
-      await page.close()
-      return screenshot
-    } catch (e: any) {
-      ctx.logger.error(`图片生成失败: ${e.message}`)
+  function cacheGet<T>(map: Map<string, { at: number } & T>, key: string): T | null {
+    const hit = map.get(key)
+    if (!hit) return null
+    if (Date.now() - hit.at > CACHE_TTL) {
+      map.delete(key)
       return null
     }
+    return hit
   }
 
-  function escapeHtml(str: string): string {
-    return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m] || m))
+  async function searchBooks(keyword: string) {
+    const items = await api.search(keyword)
+    return items.filter((item) => item.book_id && item.title)
   }
 
-  function generateTextResult(items: any[], keyword: string): string {
-    const maxResults = config.maxSearchResults || 20
-    const showItems = items.slice(0, maxResults)
-    let msg = `🔍 搜索「${keyword}」找到 ${items.length} 本：\n\n`
-    showItems.forEach((b: any, i: number) => {
-      msg += `${i+1}. ${b.title}\n`
-      if (b.author) msg += `   作者：${b.author}\n`
-      msg += `   ID: ${b.book_id}\n\n`
-    })
-    if (items.length > maxResults) {
-      msg += `... 仅展示前 ${maxResults} 本。\n`
+  async function getPreview(bookId: string) {
+    const cached = cacheGet(previewCache, bookId)
+    if (cached) return cached.preview
+    const preview = await api.preview(bookId)
+    cacheSet(previewCache, bookId, { preview })
+    return preview
+  }
+
+  /** 论证 target：纯数字且超过 15 位视为 book_id，否则当搜索序号。 */
+  async function resolveTarget(session: any, target: string): Promise<BookItem | Preview> {
+    if (/^\d{16,}$/.test(target)) return getPreview(target)
+    const cached = cacheGet(searchCache, String(session?.userId || 'global'))
+    if (!cached?.items?.length) throw new TndError('未找到搜索结果，请先使用 tnd 搜索')
+    const index = parseInt(target, 10)
+    if (!Number.isFinite(index) || index < 1 || index > cached.items.length) {
+      throw new TndError(`序号无效，请输入 1-${cached.items.length}`)
     }
-    msg += `💡 使用 tnd 下载 <序号> 下载（例如 tnd 下载 1）`
-    return msg
+    return cached.items[index - 1]
   }
 
-  function generateMarkdownResult(items: any[], keyword: string): any {
-    const maxResults = config.maxSearchResults || 20
-    const showItems = items.slice(0, maxResults)
-    
-    let md = `## 🔍 搜索「${keyword}」\n`
-    md += `> 共找到 ${items.length} 本小说\n\n`
-    md += `| 序号 | 书名 | 作者 |\n`
-    md += `|:---:|:---|:---|\n`
-    showItems.forEach((item, idx) => {
-      const title = item.title.length > 15 ? item.title.slice(0, 15) + '…' : item.title
-      const author = item.author || '未知'
-      md += `| ${idx+1} | ${title} | ${author} |\n`
-    })
-    if (items.length > maxResults) {
-      md += `\n> ⚠️ 仅展示前 ${maxResults} 本`
+  function parseRange(text?: string, total?: number): { start: number; end: number } | null {
+    if (!text) return null
+    const [rawStart, rawEnd] = text.split('-').map((part) => part.trim())
+    const start = rawStart === '' || rawStart === undefined ? 1 : parseInt(rawStart, 10)
+    const end = rawEnd === '' || rawEnd === undefined ? (total || 0) : parseInt(rawEnd, 10)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < start) {
+      throw new TndError(`章节范围无效：${text}（示例 1-50）`)
     }
-    md += `\n\n💡 回复 \`tnd 下载 <序号>\` 下载`
-    return md
+    if (total && end > total) throw new TndError(`章节范围超出总数 ${total}`)
+    return { start, end }
   }
 
-  function generateQuickReplyButtons(items: any[]): any[] {
-    const maxResults = Math.min(config.maxSearchResults || 10, 10)
-    const showItems = items.slice(0, maxResults)
-    
-    const rows: any[] = []
-    let currentRow: any[] = []
-    
-    showItems.forEach((item, idx) => {
-      const label = `${idx+1}.${item.title.length > 6 ? item.title.slice(0, 6) + '…' : item.title}`
-      currentRow.push({
-        label: label,
-        text: `tnd 下载 ${idx+1}`,
-        type: 'plain'
-      })
-      if (currentRow.length >= 5) {
-        rows.push(currentRow)
-        currentRow = []
-      }
-    })
-    if (currentRow.length > 0) {
-      rows.push(currentRow)
+  function guardCooldown(userId: string) {
+    if (!config.cooldown) return
+    const last = lastUsed.get(userId) || 0
+    const wait = config.cooldown * 1000 - (Date.now() - last)
+    if (wait > 0) throw new TndError(`操作太快，请 ${Math.ceil(wait / 1000)} 秒后再试`)
+  }
+
+  function progressLine(job: Job) {
+    const saved = job.progress?.saved_chapters || 0
+    const total = job.progress?.chapter_total || 0
+    const pct = total ? Math.round((saved / total) * 100) : 0
+    return `📥 正在下载「${job.title || job.book_id}」：${saved}/${total} 章（${pct}%）`
+  }
+
+  /** 分片睡眠，期间盯着取消标记。 */
+  async function sleepInterruptible(ms: number, userId: string) {
+    const end = Date.now() + ms
+    while (Date.now() < end) {
+      if (activeJobs.get(userId)?.cancelled) return
+      await sleep(Math.min(250, Math.max(end - Date.now(), 0)))
     }
-    
-    return rows
   }
 
-  // ========== 获取 OneBot 适配器实例 ==========
-  function getOneBotAdapter(session: any): any {
-    try {
-      const bot = session.bot as any
-      if (bot?.onebot) {
-        return bot.onebot
-      }
-    } catch (e) { /* ignore */ }
-    
-    try {
-      const bots = ctx.bots as any
-      if (bots && typeof bots.forEach === 'function') {
-        let found: any = null
-        bots.forEach((bot: any) => {
-          const platform = bot.platform || ''
-          if (platform.toLowerCase().includes('onebot') || 
-              platform.toLowerCase().includes('llonebot') ||
-              platform.toLowerCase().includes('napcat')) {
-            if (bot.onebot) found = bot.onebot
-          }
-        })
-        if (found) return found
-      }
-    } catch (e) { /* ignore */ }
-    
-    try {
-      const bots = ctx.bots as any
-      if (bots && typeof bots.get === 'function') {
-        const bot = bots.get(session.platform)
-        if (bot?.onebot) return bot.onebot
-      }
-    } catch (e) { /* ignore */ }
-    
-    return null
-  }
+  /** 轮询任务直到结束；返回最终 Job。 */
+  async function waitForJob(session: any, userId: string, jobId: number, options: { format?: string; name?: string }) {
+    const deadline = Date.now() + config.jobTimeout
+    let lastNotify = Date.now()
+    let lastSaved = -1
+    let lastState = ''
+    let nameChosen = false
+    let formatChosen = false
 
-  // ========== 清理文件名（移除非法字符） ==========
-  function sanitizeFileName(name: string): string {
-    // 移除 Windows/Linux 文件名非法字符
-    return name.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_')
-  }
+    await sleepInterruptible(Math.max(config.initialWait, 0), userId)
 
-  // ========== 多平台文件发送核心函数 ==========
-  async function sendFile(session: any, buffer: Buffer, fileName: string): Promise<any> {
-    const adapterType = getAdapterType(session)
-    const maxRetries = config.fileSendMaxRetries || 3
-    let lastError: any = null
-
-    // 清理文件名
-    const cleanFileName = sanitizeFileName(fileName)
-    logDebug(`原始文件名: ${fileName}, 清理后: ${cleanFileName}`)
-
-    // 检查文件大小 (QQ 官方限制 100MB，但建议更小)
-    const fileSizeMB = buffer.length / (1024 * 1024)
-    if (fileSizeMB > 50) {
-      logDebug(`文件较大 (${fileSizeMB.toFixed(1)}MB)，可能会上传失败`)
-    }
-
-    for (let retry = 0; retry < maxRetries; retry++) {
+    while (Date.now() < deadline) {
+      if (activeJobs.get(userId)?.cancelled) throw new TndError('下载已取消')
+      let job: Job | undefined
       try {
-        if (retry > 0) {
-          logDebug(`文件发送重试第 ${retry} 次...`)
-          await setTimeout(3000)
-        }
-
-        // ===== OneBot 适配器：直接调用 API =====
-        if (adapterType === 'onebot') {
-          const base64Data = buffer.toString('base64')
-          logDebug(`OneBot 发送文件，大小: ${(buffer.length / 1024).toFixed(1)}KB`)
-          
-          const onebot = getOneBotAdapter(session)
-          if (!onebot) {
-            logDebug('未找到 OneBot 适配器，使用 h.file 备用方案')
-            return h.file(buffer, 'text/plain', { name: cleanFileName })
-          }
-
-          const channelId = session.channelId || ''
-          const isPrivate = channelId.startsWith('private:') || channelId.startsWith('private_') || channelId.includes('private')
-          
-          let result: any
-          if (isPrivate) {
-            const userId = channelId.replace(/^private[:_]/, '').replace(/[^0-9]/g, '')
-            const targetId = parseInt(userId) || session.userId
-            logDebug(`私聊发送，用户: ${targetId}`)
-            // OneBot v11 send_private_file 参数
-            result = await onebot._request('send_private_file', {
-              user_id: typeof targetId === 'string' ? parseInt(targetId) : targetId,
-              file: base64Data,
-              name: cleanFileName
-            })
-          } else {
-            const groupId = parseInt(channelId)
-            if (isNaN(groupId)) {
-              throw new Error(`无效的群号: ${channelId}`)
-            }
-            logDebug(`群聊发送，群号: ${groupId}`)
-            // OneBot v11 upload_group_file 参数
-            result = await onebot._request('upload_group_file', {
-              group_id: groupId,
-              file: base64Data,
-              name: cleanFileName
-            })
-          }
-          
-          logDebug(`OneBot API 调用成功`)
-          return `✅ 文件「${cleanFileName}」已发送。`
-        }
-
-        // ===== QQ 官方适配器 =====
-        if (adapterType === 'qq') {
-          logDebug(`QQ 官方适配器发送文件，大小: ${(buffer.length / 1024).toFixed(1)}KB`)
-          
-          // QQ 官方适配器对文件大小有限制，如果太大则分片或使用其他方式
-          // 注意：QQ 官方适配器使用 h.file 时，文件名需要正确传递
-          return h.file(buffer, 'text/plain', { 
-            name: cleanFileName,
-            // QQ 适配器可能需要指定 type
-            type: 'file'
-          })
-        }
-
-        // ===== QQ Crack =====
-        if (adapterType === 'qq_crack') {
-          logDebug(`QQ Crack 适配器发送文件`)
-          return h.file(buffer, 'text/plain', { name: cleanFileName })
-        }
-
-        // ===== Telegram =====
-        if (adapterType === 'telegram') {
-          logDebug(`Telegram 发送文件`)
-          return h.file(buffer, 'text/plain', { name: cleanFileName })
-        }
-
-        // ===== Discord =====
-        if (adapterType === 'discord') {
-          logDebug(`Discord 发送文件`)
-          return h.file(buffer, 'text/plain', { name: cleanFileName })
-        }
-
-        // ===== 未知适配器 =====
-        logDebug(`未知适配器，使用 Buffer 方式发送`)
-        return h.file(buffer, 'text/plain', { name: cleanFileName })
-
+        job = await api.findJob(jobId)
       } catch (e: any) {
-        lastError = e
-        logDebug(`文件发送失败 (尝试 ${retry + 1}/${maxRetries}): ${e.message}`)
-        if (retry < maxRetries - 1) {
-          await setTimeout(5000)
-        }
+        debug('轮询失败: %s', e.message)
       }
+      if (!job) {
+        await sleep(config.pollInterval)
+        continue
+      }
+
+      // 服务端要求人工选择书名/格式时自动应答
+      const nameOptions = job.book_name_options || []
+      if (nameOptions.length && !nameChosen) {
+        const picked = nameOptions.find((option) => option.value === options.name || option.label === options.name) || nameOptions[0]
+        await api.chooseBookName(jobId, picked.value).catch((e) => debug('选择书名失败: %s', e.message))
+        nameChosen = true
+      }
+      const formatOptions = job.format_options || []
+      if (formatOptions.length && !formatChosen) {
+        const wanted = options.format?.toLowerCase()
+        const picked = formatOptions.find((option) => option.value === wanted || option.label === wanted) || formatOptions[0]
+        await api.chooseFormat(jobId, picked.value).catch((e) => debug('选择格式失败: %s', e.message))
+        formatChosen = true
+      }
+
+      const state = String(job.state || '')
+      if (state !== lastState) {
+        debug('任务 %d 状态: %s', jobId, state)
+        lastState = state
+      }
+      if (state === 'done') return job
+      if (state === 'failed') throw new TndError(job.message || '服务端下载失败')
+      if (state === 'canceled') throw new TndError('任务已被取消')
+
+      const saved = job.progress?.saved_chapters || 0
+      if (saved !== lastSaved && Date.now() - lastNotify > PROGRESS_NOTIFY_INTERVAL) {
+        lastSaved = saved
+        lastNotify = Date.now()
+        await session.send(progressLine(job)).catch(() => {})
+      }
+      await sleepInterruptible(config.pollInterval, userId)
     }
 
-    throw lastError || new Error('文件发送失败')
+    await api.cancelJob(jobId).catch(() => {})
+    throw new TndError(`等待超时（${Math.round(config.jobTimeout / 1000)} 秒），任务 ${jobId} 已取消`)
+  }
+
+  /** 在服务端目录里找刚生成的文件（文件名/扩展名/时间三重匹配）。 */
+  async function locateOutput(job: Job, title: string): Promise<{ rel: string; name: string; dir?: boolean; size?: number }> {
+    const titles = [title, job.title, job.book_id].filter(Boolean).map((value) => String(value))
+    let rootPath = ''
+    try {
+      const [full, status] = await Promise.all([api.fullConfig(), api.status()])
+      const savePath = (full?.save_path || '').replace(/\/+$/, '')
+      const saveDir = (status?.save_dir || '').replace(/\/+$/, '')
+      if (savePath && saveDir && savePath.startsWith(saveDir + '/')) rootPath = savePath.slice(saveDir.length + 1)
+      else if (savePath) rootPath = savePath.replace(/^\/+/, '')
+    } catch { /* 无权限时按根目录找 */ }
+
+    const deadline = Date.now() + 90_000
+    let scanned = false
+    while (Date.now() < deadline) {
+      let items = [] as Awaited<ReturnType<typeof api.library>>
+      try {
+        items = await api.library(rootPath, !scanned)
+        scanned = true
+      } catch (e: any) {
+        debug('读取目录失败: %s', e.message)
+      }
+      const created = (job.created_ms || 0) - 5000
+      const matched = items.find((item) => {
+        if (item.kind !== 'file' && item.kind !== 'dir') return false
+        const ext = (item.name.split('.').pop() || '').toLowerCase()
+        if (item.kind === 'file' && !FILE_EXT.includes(ext)) return false
+        if (created && (item.modified_ms || 0) < created) return false
+        return titles.some((title) => item.name.startsWith(title))
+      })
+      if (matched) return { rel: matched.rel_path, name: matched.name, dir: matched.kind === 'dir', size: matched.size }
+      await sleep(3000)
+    }
+    throw new TndError('任务已完成，但没在服务端目录里找到生成的文件')
   }
 
   const tnd = ctx.command('tnd', '番茄小说下载器')
+    .usage([
+      '用法：',
+      '  tnd 搜索 斗破苍穹      搜索小说',
+      '  tnd 预览 1             看简介再决定',
+      '  tnd 下载 1             下载第 1 个结果',
+      '  tnd 下载 1 --range 1-50  只下前 50 章',
+      '  tnd 取消               取消当前下载',
+      '',
+      '搜索后直接回数字 1-20 也能下载。',
+    ].join('\n'))
 
-  // ========== 搜索命令 ==========
-  const searchCmd = tnd.subcommand('.search <keyword:text>', '搜索小说')
-  searchCmd.alias('.搜索')
+  // ========== 搜索 ==========
+  const searchCmd = tnd.subcommand('.搜索 <keyword:text>', '搜索小说')
+  searchCmd.alias('.search')
+  searchCmd.usage('用法：tnd 搜索 斗破苍穹')
+  searchCmd.example('tnd 搜索 斗破苍穹')
   searchCmd.action(async ({ session }, keyword) => {
-    if (!keyword) return '用法：tnd 搜索 小说名'
-    logDebug(`搜索: ${keyword}`)
-    logDebug(`适配器类型: ${getAdapterType(session)}`)
-    
+    if (!keyword?.trim()) return '用法：tnd 搜索 小说名'
+    const userId = String(session?.userId || 'global')
     try {
-      const res = await authedFetch(`/api/search?q=${encodeURIComponent(keyword)}`)
-      if (!res.ok) return `搜索失败 (${res.status})`
-      const data = await res.json()
-      const items = data.items || []
+      const items = await searchBooks(keyword.trim())
       if (!items.length) return '没有找到相关小说。'
-      const userId = session?.userId || 'global'
-      searchCache.set(userId, { items, timestamp: Date.now() })
+      cacheSet(searchCache, userId, { items })
 
-      const adapterType = getAdapterType(session)
-
-      if (adapterType === 'onebot') {
-        logDebug('使用 OneBot 响应策略')
-        if (config.enableImage) {
-          const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
-          if (img) {
-            return h.image(img, 'image/png')
-          }
-        }
-        return generateTextResult(items, keyword)
+      if (responseMode(session) === 'onebot' || responseMode(session) === 'unknown') {
+        const image = await renderSearchImage(ctx, keyword, items, config)
+        if (image) return imageElement(image)
+        await sendLong(session, textResult(items, keyword, config.maxSearchResults), config.maxTextLength)
+        return
       }
-
-      if (adapterType === 'qq' || adapterType === 'qq_crack') {
-        logDebug('使用 QQ 响应策略')
-        if (config.enableImage) {
-          const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
-          if (img) {
-            return h.image(img, 'image/png')
-          }
-        }
-        try {
-          const md = generateMarkdownResult(items, keyword)
-          const buttons = generateQuickReplyButtons(items)
-          if (buttons.length > 0) {
-            return h('message', { type: 'markdown' }, md, h('keyboard', { rows: buttons }))
-          }
-          return h('message', { type: 'markdown' }, md)
-        } catch (e) {
-          logDebug(`Markdown 失败，降级: ${(e as any).message}`)
-        }
-        try {
-          const text = generateTextResult(items, keyword)
-          const buttons = generateQuickReplyButtons(items)
-          if (buttons.length > 0) {
-            return h('message', text, h('keyboard', { rows: buttons }))
-          }
-          return text
-        } catch (e) {
-          return generateTextResult(items, keyword)
-        }
+      if (responseMode(session) === 'qq') {
+        const image = await renderSearchImage(ctx, keyword, items, config)
+        if (image) return imageElement(image)
+        const rows = quickReplies(items, config.maxSearchResults)
+        return qqMarkdownMessage(markdownResult(items, keyword, config.maxSearchResults), rows)
       }
-
-      if (adapterType === 'telegram') {
-        logDebug('使用 Telegram 响应策略')
-        if (config.enableImage) {
-          const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
-          if (img) return h.image(img, 'image/png')
-        }
-        try {
-          const md = generateMarkdownResult(items, keyword)
-          return h('message', { type: 'markdown' }, md)
-        } catch {
-          return generateTextResult(items, keyword)
-        }
+      const image = await renderSearchImage(ctx, keyword, items, config)
+      if (image) return imageElement(image)
+      if (responseMode(session) === 'telegram') {
+        return h('message', { type: 'markdown' }, markdownResult(items, keyword, config.maxSearchResults))
       }
-
-      if (adapterType === 'discord') {
-        logDebug('使用 Discord 响应策略')
-        if (config.enableImage) {
-          const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
-          if (img) return h.image(img, 'image/png')
-        }
-        return generateTextResult(items, keyword)
-      }
-
-      logDebug('使用未知适配器响应策略')
-      if (config.enableImage) {
-        const img = await renderResultsAsImage(items.slice(0, config.maxSearchResults || 20), keyword)
-        if (img) return h.image(img, 'image/png')
-      }
-      return generateTextResult(items, keyword)
-
+      return textResult(items, keyword, config.maxSearchResults)
     } catch (e: any) {
+      ctx.logger.warn('搜索失败: %s', e.message)
       return `搜索失败: ${e.message}`
     }
   })
 
-  // ========== 下载命令 ==========
-  const downloadCmd = tnd.subcommand('.download <target>', '下载小说')
-  downloadCmd.alias('.下载')
-  downloadCmd.action(async ({ session }, target) => {
-    if (!target) return '用法：tnd 下载 <序号> 或 tnd 下载 <book_id>'
-    logDebug(`下载目标: ${target}`)
-
-    let book_id: string | null = null
-    let book_title: string | null = null
-
-    if (/^\d+$/.test(target) && target.length > 15) {
-      book_id = target
-    } else {
-      const userId = session?.userId || 'global'
-      const cached = searchCache.get(userId)
-      if (!cached || Date.now() - cached.timestamp > CACHE_TTL) {
-        return '未找到搜索结果，请先使用 tnd 搜索'
-      }
-      const idx = parseInt(target, 10)
-      if (isNaN(idx) || idx < 1 || idx > cached.items.length) {
-        return `序号无效，请输入 1-${cached.items.length}`
-      }
-      book_id = cached.items[idx-1].book_id
-      book_title = cached.items[idx-1].title
-    }
-    if (!book_id) return '无法获取小说 ID'
-    if (!book_title) return '无法获取书名，请重新搜索'
-
+  // ========== 预览 ==========
+  const previewCmd = tnd.subcommand('.预览 <target>', '预览小说信息')
+  previewCmd.alias('.preview')
+  previewCmd.usage('用法：tnd 预览 1（序号来自上一次搜索）')
+  previewCmd.example('tnd 预览 1')
+  previewCmd.action(async ({ session }, target) => {
+    if (!target) return '用法：tnd 预览 <序号|book_id>'
     try {
-      const createRes = await authedFetch('/api/jobs', {
-        method: 'POST',
-        body: JSON.stringify({ book_id })
-      })
-      if (!createRes.ok) return `创建任务失败 (${createRes.status})`
-      const job = await createRes.json()
-      const taskId = job.id || job.data?.id
-      if (!taskId) return `创建失败: ${JSON.stringify(job)}`
-
-      await session?.send(`📥 任务已创建 (ID: ${taskId})，正在下载...`)
-
-      const INITIAL_WAIT = config.initialWait || 30000
-      const RETRY_INTERVAL = config.retryInterval || 10000
-      const MAX_RETRIES = config.maxFileCheckRetries || 33
-
-      await setTimeout(INITIAL_WAIT)
-
-      const fileName = `${book_title}.txt`
-      const fileUrl = `${base}/download/${encodeURIComponent(fileName)}`
-
-      for (let i = 0; i < MAX_RETRIES; i++) {
-        try {
-          const checkRes = await fetch(fileUrl, {
-            method: 'HEAD',
-            headers: { Cookie: cookieString || '' }
-          })
-          
-          if (checkRes.ok) {
-            logDebug(`文件已就绪 (尝试 ${i+1} 次)`)
-            
-            const fileRes = await fetch(fileUrl, {
-              headers: { Cookie: cookieString || '' }
-            })
-            
-            if (!fileRes.ok) {
-              return `下载文件失败 (HTTP ${fileRes.status})`
-            }
-            
-            const arrayBuffer = await fileRes.arrayBuffer()
-            const buffer = Buffer.from(arrayBuffer)
-
-            await session?.send(`✅ 小说「${book_title}」下载完成！正在发送文件...`)
-
-            // 文件名格式: 书名_小说ID.txt
-            const fileNameWithId = `${book_title}_${book_id}.txt`
-            
-            try {
-              return await sendFile(session, buffer, fileNameWithId)
-            } catch (e: any) {
-              return `❌ 文件发送失败，请稍后重试。错误: ${e.message}`
-            }
-          }
-          
-          logDebug(`文件未就绪 (尝试 ${i+1}/${MAX_RETRIES})，状态码: ${checkRes.status}`)
-        } catch (e: any) {
-          logDebug(`检查文件异常: ${e.message}`)
-        }
-        
-        await setTimeout(RETRY_INTERVAL)
-      }
-
-      return `下载超时（已等待 ${(INITIAL_WAIT + MAX_RETRIES * RETRY_INTERVAL) / 1000} 秒），请稍后手动访问 TND 获取。任务 ID: ${taskId}`
+      const book = await resolveTarget(session, target)
+      const preview = 'book_name' in book ? book : await getPreview(book.book_id)
+      const image = await renderPreviewImage(ctx, preview, config.imageWidth)
+      if (image) return imageElement(image)
+      const text = previewText(preview)
+      await sendLong(session, text, config.maxTextLength)
     } catch (e: any) {
-      ctx.logger.error(`下载异常: ${e.message}`)
-      return `下载失败: ${e.message}`
+      return `预览失败: ${e.message}`
     }
   })
+
+  // ========== 下载 ==========
+  async function runDownload(session: any, target: string, options: any = {}) {
+    if (!target) return '用法：tnd 下载 序号 [--range 1-50]'
+    const userId = String(session?.userId || 'global')
+
+    try {
+      guardCooldown(userId)
+      if (runningJobs >= config.maxConcurrentJobs) throw new TndError('当前下载任务已满，请稍后再试')
+      if ((perUserJobs.get(userId) || 0) >= 1) throw new TndError('你已有下载任务在进行中')
+
+      const resolved = await resolveTarget(session, target)
+      const preview = 'book_name' in resolved ? resolved : null
+      const book: BookItem = preview
+        ? { book_id: preview.book_id, title: preview.book_name, author: preview.author }
+        : (resolved as BookItem)
+
+      const range = parseRange(options?.range, preview?.chapter_count)
+      const job = await api.createJob(book.book_id, range || undefined)
+      lastUsed.set(userId, Date.now())
+      perUserJobs.set(userId, 1)
+      activeJobs.set(userId, { id: job.id, cancelled: false })
+      runningJobs++
+
+      try {
+        await session?.send(`📥 已创建任务 #${job.id}：${book.title}${range ? `（第 ${range.start}-${range.end} 章）` : ''}，开始下载...`)
+        const finished = await waitForJob(session, userId, job.id, { format: options?.format, name: options?.name })
+        const saved = finished.progress?.saved_chapters || 0
+        const total = finished.progress?.chapter_total || 0
+        if (total && saved < total) {
+          await session?.send(`⚠️ 有 ${total - saved} 章失败，继续发送已下载的 ${saved} 章`).catch(() => {})
+        }
+        const output = await locateOutput(finished, book.title)
+        const extension = output.dir ? 'zip' : (output.name.split('.').pop() || 'txt')
+        let fileName = options?.name || output.name
+        if (!fileName.toLowerCase().endsWith('.' + extension)) fileName += '.' + extension
+        const sizeText = formatBytes(output.size)
+        await session?.send(`✅ 下载完成：${output.name}（${sizeText}），正在发送${output.dir ? '压缩包' : '文件'}...`).catch(() => {})
+        const message = await sendNovelFile(ctx, session, api, output.rel, fileName, config, { zipped: output.dir, sizeText })
+        if (config.cleanupJob) api.deleteJob(job.id).catch((e) => ctx.logger.warn('清理任务 %d 失败: %s', job.id, e.message))
+        return message
+      } finally {
+        const active = activeJobs.get(userId)
+        if (active?.id === job.id) activeJobs.delete(userId)
+        runningJobs = Math.max(runningJobs - 1, 0)
+        perUserJobs.delete(userId)
+      }
+    } catch (e: any) {
+      if (e instanceof TndError) return e.message === '下载已取消' ? '' : e.message
+      ctx.logger.warn('下载失败: %s', e.message)
+      return `下载失败: ${e.message}`
+    }
+  }
+
+  const downloadCmd = tnd.subcommand('.下载 <target>', '下载小说')
+    .option('format', '-f <format:string> 输出格式（txt/epub/pdf），服务端要求选择时生效')
+    .option('range', '-r <range:string> 章节范围，如 1-50')
+    .option('name', '-n <name:string> 指定文件名')
+  downloadCmd.alias('.download')
+  downloadCmd.usage('用法：tnd 下载 1（序号来自上一次搜索）')
+  downloadCmd.example('tnd 下载 1 --range 1-50')
+  downloadCmd.action(({ session, options }, target) => runDownload(session, target, options))
+
+  const cancelCmd = tnd.subcommand('.取消', '取消当前下载')
+  cancelCmd.alias('.cancel')
+  cancelCmd.usage('用法：tnd 取消（取消自己正在进行的下载）')
+  cancelCmd.example('tnd 取消')
+  cancelCmd.action(async ({ session }) => {
+    const userId = String(session?.userId || 'global')
+    const active = activeJobs.get(userId)
+    if (!active) return '你当前没有正在进行的下载。'
+    if (active.cancelled) return `任务 #${active.id} 正在取消中。`
+    active.cancelled = true
+    try {
+      await api.cancelJob(active.id)
+    } catch (e: any) {
+      active.cancelled = false
+      return `取消失败: ${e.message}`
+    }
+    return `🛑 已取消任务 #${active.id}，不再等待下载`
+  })
+
+  // 搜索后直接回数字即可下载
+  if (config.quickDownload) {
+    ctx.middleware(async (session, next) => {
+      const text = session.content?.trim()
+      if (!text || !/^\d{1,2}$/.test(text)) return next()
+      const cached = cacheGet(searchCache, String(session.userId || 'global'))
+      if (!cached?.items?.length) return next()
+      const index = parseInt(text, 10)
+      if (index < 1 || index > cached.items.length) return `序号无效，请输入 1-${cached.items.length}`
+      return runDownload(session, text)
+    }, true)
+  }
 }
