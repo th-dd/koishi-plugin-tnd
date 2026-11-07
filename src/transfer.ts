@@ -12,6 +12,19 @@ import type { TndApi } from './api'
 import type { TndConfig } from './types'
 import { responseMode } from './render'
 
+/** 把适配器/腾讯的原始报错翻译成用户能照做的提示；不认识就返回 null。 */
+export function friendlySendError(error: any): string | null {
+  const text = String(error?.message || error?.code || error || '')
+  if (!text) return null
+  if (/权限|不允许|未开启|无权限|forbidden|no permission|not allow|not authorized|permission/i.test(text)) {
+    return '当前会话不能发文件。群聊需要管理员在「群设置 → 文件 → 允许群成员上传文件」里打开，或把机器人设为管理员；私聊需要机器人有文件权限'
+  }
+  if (/size|too large|过大|100MB/i.test(text)) return '文件超过平台大小限制，可加 --range 分段下载'
+  if (/audit|审核|reject/i.test(text)) return '腾讯审核未通过，稍后重试或换私聊'
+  if (/(304003|40034|41003|403|401)/.test(text)) return '接口拒绝（鉴权/权限不足）：确认群文件权限，或检查插件里的 apiPassword'
+  return null
+}
+
 export function sanitizeFileName(name: string) {
   return name
     .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')

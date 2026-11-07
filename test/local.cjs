@@ -460,6 +460,27 @@ async function main() {
   assert.ok(replies[0].includes('<img'), '没有图片: ' + replies[0].slice(0, 120))
   assert.ok(!replies[0].includes('qq:markdown'), '图片里混了 markdown')
 
+  console.log('22. 没权限发文件时给可照做的提示')
+  assert.match(transferMod.friendlySendError(new Error('no permission to upload file')), /允许群成员上传文件|管理员/)
+  assert.match(transferMod.friendlySendError(new Error('file too large')), /--range/)
+  assert.match(transferMod.friendlySendError(new Error('audit reject')), /审核/)
+  assert.strictEqual(transferMod.friendlySendError(new Error('boom')), null)
+  const deny = await boot()
+  const denyClient = deny.app.mock.client('40004')
+  denyClient.event.platform = 'qq'
+  await denyClient.receive('tnd 搜索 测试')
+  const bot = deny.app.bots[0]
+  const originSend = bot.sendMessage.bind(bot)
+  bot.sendMessage = async (channelId, fragment, ...rest) => {
+    if (String(fragment).includes('<file')) throw new Error('no permission to upload file (304003)')
+    return originSend(channelId, fragment, ...rest)
+  }
+  replies = await denyClient.receive('tnd 下载 1 --range 1-1')
+  const failure = replies.join('\n')
+  assert.ok(failure.includes('发送失败'), '没有失败提示: ' + failure.slice(0, 200))
+  assert.ok(failure.includes('允许群成员上传文件'), '缺少权限指引: ' + failure.slice(0, 300))
+  assert.ok(failure.includes(server.base + '/download/'), '没有给下载链接: ' + failure.slice(0, 300))
+
   console.log('\nALL LOCAL TESTS PASSED')
 }
 

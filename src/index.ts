@@ -15,7 +15,7 @@ import {
   sendLong,
   textResult,
 } from './render'
-import { sendNovelFile } from './transfer'
+import { friendlySendError, sendNovelFile } from './transfer'
 
 export const name = 'novel-downloader'
 // puppeteer 是可选依赖：装了就能出图，没装自动降级为文字。
@@ -349,7 +349,26 @@ export function apply(ctx: Context, config: Config) {
         if (!fileName.toLowerCase().endsWith('.' + extension)) fileName += '.' + extension
         const sizeText = formatBytes(output.size)
         await session?.send(`✅ 下载完成：${output.name}（${sizeText}），正在发送${output.dir ? '压缩包' : '文件'}...`).catch(() => {})
-        const message = await sendNovelFile(ctx, session, api, output.rel, fileName, config, { zipped: output.dir, sizeText })
+        let message: any
+        try {
+          const result = await sendNovelFile(ctx, session, api, output.rel, fileName, config, { zipped: output.dir, sizeText })
+          if (typeof result === 'string') message = result
+          else {
+            // 非 OneBot 适配器由我们自己发送，才能捕获「没权限发文件」这类错误。
+            // 注意 session.send 会吞异常（只打 warn），必须直接调 bot.sendMessage。
+            await session.bot.sendMessage(session.channelId, h.normalize(result), session.event?.referrer, { session })
+            message = `✅ 文件「${fileName}」已发送（大小 ${sizeText}）`
+          }
+        } catch (e: any) {
+          const hint = friendlySendError(e)
+          const link = output.dir ? api.zipUrl(output.rel) : api.downloadUrl(output.rel)
+          ctx.logger.warn('文件发送失败 %s: %s', fileName, e.message)
+          return [
+            `❌ 文件「${fileName}」发送失败${hint ? '：' + hint + '。' : '。'}`,
+            `文件已生成在服务器，可点这里手动下载：${link}`,
+            `（原始错误：${e.message}）`,
+          ].join('\n')
+        }
         if (config.cleanupJob) api.deleteJob(job.id).catch((e) => ctx.logger.warn('清理任务 %d 失败: %s', job.id, e.message))
         return message
       } finally {
