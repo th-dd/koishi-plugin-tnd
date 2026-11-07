@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-novel-downloader",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "番茄小说下载器 Koishi 插件（对接 TND 服务）",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -10,6 +10,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
     "prepack": "npm run build",
     "test": "node test/plugin.mjs && node test/local.cjs",
     "test:live": "node test/command.mjs && node test/smoke.mjs"
